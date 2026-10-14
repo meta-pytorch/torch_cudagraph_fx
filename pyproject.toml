@@ -1,0 +1,50 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "torch_cudagraph_fx"
+version = "0.1.0"
+description = "A make_fx-style tracer and interpreter for CUDA-graphable training steps"
+readme = "README.md"
+license = {text = "BSD-3-Clause"}
+requires-python = ">=3.10"
+authors = [
+    {name = "Meta Platforms, Inc."},
+]
+dependencies = [
+    "torch>=2.10.0",
+]
+
+[tool.setuptools.packages.find]
+include = ["torch_cudagraph_fx*"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]
+
+[tool.ruff.lint.isort]
+order-by-type = false
+known-third-party = ["torch_cudagraph_fx"]
+
+[tool.ruff.format]
+quote-style = "double"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py", "*_test.py"]
+# Register the GPU-count markers so pytest runs without unknown-mark warnings and
+# can select by GPU count via `-m "gpus_needed_1"` / `-m "gpus_needed_2"`.
+markers = [
+    "gpus_needed_1: Requires 1 GPU to run.",
+    "gpus_needed_2: Requires 2 GPUs to run.",
+]
