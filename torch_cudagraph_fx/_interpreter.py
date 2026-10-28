@@ -87,8 +87,9 @@ class CudaGraphFxInterpreter(fx.Interpreter):
             replay_stream = torch.cuda.current_stream()
             with self._set_current_node(n):
                 args, kwargs = self.fetch_args_kwargs_from_env(n)
+                self._record_tensor_streams((args, kwargs), replay_stream)
                 result = getattr(self, n.op)(n.target, args, kwargs)
-            self._record_tensor_streams((args, kwargs, result), replay_stream)
+            self._record_tensor_streams(result, replay_stream)
             return result
 
     def run_fn(self, *args: Any, **kwargs: Any) -> Any:
