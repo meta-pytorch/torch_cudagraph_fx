@@ -306,6 +306,42 @@ class GraphModule(torch.nn.Module):
             fx_trace.replay({"pair": [x, y]}, scale=scale)
 
     @requires_gpus(1)
+    def test_replay_preserves_freed_input_storage_on_another_stream(self) -> None:
+        if torch.cuda.memory.get_allocator_backend() != "native":
+            pytest.skip("requires the native CUDA caching allocator")
+
+        @custom_op("test::read_and_free_storage", mutates_args=("x", "out"))
+        def read_and_free(x: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+            out.copy_(x)
+            x.untyped_storage().resize_(0)
+            return out
+
+        size = 1024 * 1024
+        fx_trace = make_cudagraph_fx(read_and_free)(
+            torch.empty(size, device="cuda"), torch.empty(size, device="cuda")
+        )
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+
+        x = torch.ones(size, device="cuda")
+        out = torch.empty_like(x)
+        consumer_stream = torch.cuda.Stream()
+        consumer_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(consumer_stream):
+            torch.cuda._sleep(200_000_000)
+            result = fx_trace.replay(x, out)
+
+        replacement = torch.full_like(out, 7.0)
+        consumer_pending = not consumer_stream.query()
+        torch.cuda.synchronize()
+        del replacement
+
+        assert consumer_pending, (
+            "the input read must overlap the replacement allocation"
+        )
+        torch.testing.assert_close(result, torch.ones_like(result), rtol=0, atol=0)
+
+    @requires_gpus(1)
     def test_replay_supports_non_tensor_outputs(self) -> None:
         marker = object()
 
