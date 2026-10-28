@@ -12,6 +12,7 @@ from torch_cudagraph_fx._events import (
     record_event,
     wait_event,
 )
+from torch_cudagraph_fx._references import trace_reference
 from torch_cudagraph_fx._tracer import (
     CudaGraphFxTrace,
     CudaGraphState,
@@ -34,6 +35,7 @@ __all__ = [
     "CudaGraphState",
     "custom_op",
     "trace_leaf",
+    "trace_reference",
     "make_cudagraph_fx",
     "new_event",
     "record_event",

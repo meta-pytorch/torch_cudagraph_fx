@@ -16,6 +16,7 @@ from typing import Any, Literal
 import torch
 import torch.utils._pytree as pytree
 from torch._library.opaque_object import get_opaque_type_name, is_opaque_type
+from torch_cudagraph_fx._references import is_trace_reference
 
 from .arg_path import ArgPath
 
@@ -45,6 +46,8 @@ def schema_type(value: Any, *, is_output: bool = False) -> str:
     for typ, schema in table.items():
         if isinstance(value, typ):
             return schema
+    if is_trace_reference(value):
+        return "Any"
     if is_opaque_type(type(value)):
         return get_opaque_type_name(type(value))
     raise TypeError(

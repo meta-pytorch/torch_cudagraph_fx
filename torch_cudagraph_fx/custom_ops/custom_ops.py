@@ -10,6 +10,7 @@ import dataclasses
 import inspect
 import os
 from collections.abc import Callable, Iterable
+from types import MethodType
 from typing import Any
 
 import torch
@@ -211,6 +212,9 @@ class CustomOp:
             )
         return self._fn(*args, **kwargs)
 
+    def __get__(self, instance: Any, owner: type[Any] | None = None) -> Any:
+        return self if instance is None else MethodType(self, instance)
+
 
 def custom_op(
     qualname: str,
@@ -222,11 +226,12 @@ def custom_op(
     Each input of the custom operator may be:
     - one of the supported leaf types (Tensor, SymInt/int, bool, float,
       str, dtype, device, ProcessGroup, an opaque object registered by
-      ``torch._library.register_opaque_type``)
+      ``torch._library.register_opaque_type``, or a trace_reference class)
     - nested containers (list/tuple/dict/dataclasses) of the previous item
 
     Each output of the custom operator may be:
-    - a symbolic leaf type (Tensor, SymInt, or a registered opaque object)
+    - a symbolic leaf type (Tensor, SymInt, a registered opaque object, or a
+      trace_reference class)
     - nested containers of the previous item
 
     Please specify which Tensors are being mutated via `mutates_args`

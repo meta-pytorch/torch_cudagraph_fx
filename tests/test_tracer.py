@@ -872,7 +872,10 @@ class GraphModule(torch.nn.Module):
 def test_trace_preserves_other_graph_annotations() -> None:
     x = torch.zeros(32, device="cuda")
     graph = torch.cuda.CUDAGraph()
-    with annotated_capture(graph):
+    with (
+        torch.autograd.grad_mode.set_multithreading_enabled(False),
+        annotated_capture(graph),
+    ):
         with mark_kernels({"name": "other_graph"}):
             x.add_(1)
 
@@ -1156,7 +1159,10 @@ class GraphModule(torch.nn.Module):
     torch.cuda.current_stream().wait_stream(warmup)
 
     graph = torch.cuda.CUDAGraph()
-    with annotated_capture(graph, stream=warmup):
+    with (
+        torch.autograd.grad_mode.set_multithreading_enabled(False),
+        annotated_capture(graph, stream=warmup),
+    ):
         interp.run_fn(x, w)
 
     new_annotations = [

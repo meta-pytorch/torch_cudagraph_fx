@@ -20,11 +20,14 @@ from torch_cudagraph_fx._metadata import (
     node_fx_id,
     node_stream,
 )
+from torch_cudagraph_fx._references import is_trace_reference
 
 
 def is_graph_variable(value: Any) -> bool:
     """Whether a value gets a graph binding; enums are embedded as literals."""
-    return isinstance(value, (torch.Tensor, OpaqueBase)) and not isinstance(value, Enum)
+    return (
+        isinstance(value, (torch.Tensor, OpaqueBase)) or is_trace_reference(value)
+    ) and not isinstance(value, Enum)
 
 
 class CudaGraphFxInterpreter(fx.Interpreter):
