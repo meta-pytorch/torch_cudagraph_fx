@@ -29,9 +29,11 @@ from torch_cudagraph_fx import (
     register_dataclass_pytree,
     trace_dataclass,
     trace_leaf,
+    trace_reference,
 )
 from torch_cudagraph_fx._cudagraph_annotations import annotations_available
 from torch_cudagraph_fx._metadata import node_fx_id, node_metadata, node_tensor_meta
+from torch_cudagraph_fx._references import is_trace_reference
 from torch_cudagraph_fx._tracer import _CudagraphFxDispatchMode
 from torch_cudagraph_fx.custom_ops.arg_path import parse_arg_path
 from torch_cudagraph_fx.custom_ops.schema import (
@@ -177,6 +179,71 @@ class GraphModule(torch.nn.Module):
         expected = fn(eager_x)
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
         torch.testing.assert_close(replay_x, eager_x, rtol=0, atol=0)
+
+    def test_trace_reference_registration_is_conditional(self) -> None:
+        class Reference:
+            pass
+
+        ref = Reference()
+        with patch.dict(os.environ, CGFX_TRACING="0"):
+            trace_reference(Reference)
+        assert not is_trace_reference(ref)
+        with patch.dict(os.environ, CGFX_TRACING="1"):
+            trace_reference(Reference)
+            trace_reference(Reference)
+        assert is_trace_reference(ref)
+
+    @requires_gpus(1)
+    def test_trace_leaf_methods_preserve_reference_dataflow(self) -> None:
+        with patch.dict(os.environ, CGFX_TRACING="1"):
+
+            class Handle:
+                def __init__(self, increment: float) -> None:
+                    self.increment = increment
+
+                @trace_leaf("cudagraph_fx_test::handle_wait", mutates_args=("x",))
+                def wait(self, x: torch.Tensor) -> None:
+                    x.add_(self.increment)
+
+            class Source:
+                def __init__(self, increment: float) -> None:
+                    self.increment = increment
+
+                @trace_leaf("cudagraph_fx_test::source_issue")
+                def issue(self) -> Handle:
+                    return Handle(self.increment)
+
+            trace_reference(Handle)
+            trace_reference(Source)
+
+            def step(source: Source, x: torch.Tensor) -> tuple[torch.Tensor, Handle]:
+                handle = source.issue()
+                handle.wait(x)
+                return x, handle
+
+            x = torch.zeros(4, device="cuda")
+            trace = make_cudagraph_fx(step)(Source(1.0), x)
+        self.assertExpectedInline(
+            trace.print_readable(print_output=False),
+            """\
+class GraphModule(torch.nn.Module):
+    def forward(self, arg_0, arg_1):
+        # stream 0
+        source_issue = torch.ops.cudagraph_fx_test.source_issue(arg_0);  arg_0 = None
+        getitem = source_issue[0];  source_issue = None
+        # stream 0
+        handle_wait = torch.ops.cudagraph_fx_test.handle_wait(getitem, arg_1);  handle_wait = None
+        return (arg_1, getitem)""",
+        )
+        replay_x = torch.zeros_like(x)
+        result, handle = trace.replay(Source(3.0), replay_x)
+        assert result is replay_x
+        assert handle.increment == 3.0
+        torch.testing.assert_close(result, torch.full_like(x, 3.0), rtol=0, atol=0)
+        calls = [n for n in trace.graph.nodes if n.op == "call_function"]
+        wait = next(n for n in calls if n.name == "handle_wait")
+        assert wait.args[0].op == "call_function"
+        assert wait.args[0].args[0].name == "source_issue"
 
     @requires_gpus(1)
     def test_trace_leaf_disabled_traces_inner_operators(self) -> None:

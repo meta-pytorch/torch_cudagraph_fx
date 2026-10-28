@@ -18,7 +18,6 @@ from typing import Any, Callable
 import torch
 import torch.fx as fx
 import torch.utils._pytree as pytree
-from torch._opaque_base import OpaqueBase
 from torch.utils._python_dispatch import TorchDispatchMode
 from torch.utils._pytree import tree_flatten, tree_map, TreeSpec
 from torch.utils.weak import WeakIdKeyDictionary
@@ -297,7 +296,7 @@ class _CudagraphFxDispatchMode(TorchDispatchMode):
         node: fx.Node,
     ) -> None:
         """Register a runtime value and enrich its already attached node metadata."""
-        if isinstance(value, (torch.Tensor, OpaqueBase)):
+        if is_graph_variable(value):
             self._value_to_node[value] = node
         else:
             self._constant_nodes[id(value)] = node
@@ -308,7 +307,7 @@ class _CudagraphFxDispatchMode(TorchDispatchMode):
         self,
         value: Any,
     ) -> fx.Node | None:
-        if isinstance(value, (torch.Tensor, OpaqueBase)):
+        if is_graph_variable(value):
             return self._value_to_node.get(value)
         return self._constant_nodes.get(id(value))
 
@@ -482,9 +481,9 @@ def make_cudagraph_fx(
         flat_args, in_spec = tree_flatten((args, kwargs))
         cuda_graph = torch.cuda.CUDAGraph(keep_graph=True)
         with (
+            torch.autograd.grad_mode.set_multithreading_enabled(False),
             annotated_capture(cuda_graph),
             trace_cuda_event_constructors(),
-            torch.autograd.grad_mode.set_multithreading_enabled(False),
             mode,
             mode.metadata.enable_autograd_hooks(),
         ):
