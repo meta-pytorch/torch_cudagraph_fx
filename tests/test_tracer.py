@@ -1021,8 +1021,37 @@ def test_uncaptured_kernel_raise_names_the_launch() -> None:
     with pytest.raises(
         RuntimeError,
         match=r"1 kernel launch\(es\) had no fx node.*missing from the trace.*_add_one",
-    ):
+    ) as exc_info:
         make_cudagraph_fx(fn)(x)
+    assert "allow_missing_kernels=True to make_cudagraph_fx" in str(exc_info.value)
+
+
+@requires_gpus(1)
+@pytest.mark.skipif(
+    not annotations_available(),
+    reason="completeness check needs cudaGraphNodeGetToolsId "
+    "(run with LD_LIBRARY_PATH=$CONDA_PREFIX/cuda-compat)",
+)
+def test_allow_missing_kernels_warns_and_returns_trace() -> None:
+    def fn(x: torch.Tensor) -> tuple[torch.Tensor]:
+        _triton_add_one_inplace[(1,)](x, x.numel(), BLOCK_SIZE=32)
+        return (x,)
+
+    x = torch.zeros(32, device="cuda")
+    fn(x)
+    torch.cuda.synchronize()
+
+    with pytest.warns(
+        RuntimeWarning,
+        match=r"1 kernel launch\(es\).*missing from the trace.*_triton_add_one_inplace",
+    ) as warning_info:
+        fx_trace = make_cudagraph_fx(fn, allow_missing_kernels=True)(x)
+
+    assert len(warning_info) == 1
+    assert "replay may produce incorrect results" in str(warning_info[0].message)
+    assert warning_info[0].filename == __file__
+    assert not any(node.op == "call_function" for node in fx_trace.graph.nodes)
+    assert fx_trace.replay(x)[0] is x
 
 
 @requires_gpus(1)

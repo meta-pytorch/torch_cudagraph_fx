@@ -175,6 +175,8 @@ def _walk_graph_nodes(
 
 def _check_uncaptured_kernels(
     cuda_graph: torch.cuda.CUDAGraph,
+    *,
+    allow_missing_kernels: bool = False,
 ) -> None:
     if not annotations_available():
         warnings.warn(
@@ -206,10 +208,20 @@ def _check_uncaptured_kernels(
             )
         )
     if uncaptured:
-        raise RuntimeError(_format_uncaptured_kernels(uncaptured))
+        message = _format_uncaptured_kernels(
+            uncaptured, allow_missing_kernels=allow_missing_kernels
+        )
+        if allow_missing_kernels:
+            warnings.warn(message, RuntimeWarning, stacklevel=3)
+        else:
+            raise RuntimeError(message)
 
 
-def _format_uncaptured_kernels(uncaptured: list[_UncapturedKernel]) -> str:
+def _format_uncaptured_kernels(
+    uncaptured: list[_UncapturedKernel],
+    *,
+    allow_missing_kernels: bool,
+) -> str:
     no_py_stack = "Python launch stack not captured."
     names = [k.name or k.node_type for k in uncaptured]
     lines = [
@@ -222,6 +234,16 @@ def _format_uncaptured_kernels(uncaptured: list[_UncapturedKernel]) -> str:
         )
         stack = kernel.py_stack or no_py_stack
         lines.extend(f"    {frame}" for frame in stack.splitlines())
+    if allow_missing_kernels:
+        lines.append(
+            "Continuing with an incomplete FX graph; replay may produce incorrect "
+            "results."
+        )
+    else:
+        lines.append(
+            "To return the incomplete trace with a warning, pass "
+            "allow_missing_kernels=True to make_cudagraph_fx."
+        )
     return "\n".join(lines)
 
 
@@ -474,6 +496,7 @@ def make_cudagraph_fx(
     fn: Callable[..., Any],
     *,
     retain_cudagraph: bool = False,
+    allow_missing_kernels: bool = False,
 ) -> Callable[..., CudaGraphFxTrace]:
     def traced(*args: Any, **kwargs: Any) -> CudaGraphFxTrace:
         graph = fx.Graph()
@@ -498,7 +521,9 @@ def make_cudagraph_fx(
                     for o in out_flat
                 )
             )
-        _check_uncaptured_kernels(cuda_graph)
+        _check_uncaptured_kernels(
+            cuda_graph, allow_missing_kernels=allow_missing_kernels
+        )
         mode.metadata.post_process()
         gm = fx.GraphModule(mode.root, graph)
         return CudaGraphFxTrace(

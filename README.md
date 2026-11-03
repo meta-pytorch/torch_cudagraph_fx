@@ -159,6 +159,15 @@ capture, any annotatable launch (`kernel`, `memcpy`, `memset`, or
 fx_trace = make_cudagraph_fx(step)(x, w)
 ```
 
+To return an incomplete trace, pass `allow_missing_kernels=True`
+(default: `False`). Missing launches then emit a `RuntimeWarning` instead of
+raising. They remain absent from the FX graph, so replay may produce incorrect
+results.
+
+```python
+fx_trace = make_cudagraph_fx(step, allow_missing_kernels=True)(x, w)
+```
+
 The error automatically includes each missing launch's Python stack when
 PyTorch's CUDA graph stack recording is available. Stacks show
 `filename:line:function`, innermost first, with framework frames filtered by
