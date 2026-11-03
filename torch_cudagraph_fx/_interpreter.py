@@ -69,6 +69,12 @@ class CudaGraphFxInterpreter(fx.Interpreter):
         self._in_spec = in_spec
         self._out_spec = out_spec
         self._side_streams: dict[int, torch.cuda.Stream] = {}
+        # fx.Interpreter frees a value after its last user runs, so a result no
+        # node reads would stay alive until the graph finishes; eager drops it
+        # immediately.
+        for node in self.graph.nodes:
+            if node.op == "call_function" and not node.users:
+                self.user_to_last_uses.setdefault(node, []).append(node)
 
     def _stream_for(self, stream_id: int) -> torch.cuda.Stream | None:
         if stream_id == 0:

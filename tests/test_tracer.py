@@ -332,6 +332,23 @@ class GraphModule(torch.nn.Module):
         torch.testing.assert_close(result, torch.full_like(result, 3), rtol=0, atol=0)
 
     @requires_gpus(1)
+    def test_replay_frees_unused_results(self) -> None:
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            _ = x * 2
+            return x + 1
+
+        x = torch.ones(1 << 20, device="cuda")
+        fx_trace = make_cudagraph_fx(fn)(x)
+        torch.cuda.synchronize()
+        start = torch.cuda.memory_allocated()
+        torch.cuda.reset_peak_memory_stats()
+
+        got = fx_trace.replay(x)
+
+        assert torch.cuda.max_memory_allocated() - start == x.nbytes
+        torch.testing.assert_close(got, x + 1, rtol=0, atol=0)
+
+    @requires_gpus(1)
     def test_replay_uses_optional_remat_placeholder_check(self) -> None:
         self.addCleanup(interpreter._remat_placeholder_check.cache_clear)
         x = torch.empty(4, device="cuda")
