@@ -6,7 +6,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from enum import Enum
+from functools import cache
 from typing import Any
 
 import torch
@@ -21,6 +23,17 @@ from torch_cudagraph_fx._metadata import (
     node_stream,
 )
 from torch_cudagraph_fx._references import is_trace_reference
+
+
+@cache
+def _remat_placeholder_check() -> Callable[[torch.Tensor], bool] | None:
+    try:
+        from torch_remat import is_placeholder
+    except ModuleNotFoundError as error:
+        if error.name != "torch_remat":
+            raise
+        return None
+    return is_placeholder
 
 
 def is_graph_variable(value: Any) -> bool:
@@ -71,8 +84,14 @@ class CudaGraphFxInterpreter(fx.Interpreter):
         # have been allocated on another one), so its memory is not recycled while
         # this stream still has pending work touching it. Memory lifetime only --
         # cross-stream ordering comes from the event nodes.
+        is_placeholder = _remat_placeholder_check()
         for leaf in tree_flatten(value)[0]:
-            if isinstance(leaf, torch.Tensor) and leaf.device.type == "cuda":
+            if (
+                isinstance(leaf, torch.Tensor)
+                and leaf.device.type == "cuda"
+                and leaf.untyped_storage().nbytes() > 0
+                and (is_placeholder is None or not is_placeholder(leaf))
+            ):
                 leaf.record_stream(stream)
 
     def run_node(self, n: fx.Node) -> Any:
