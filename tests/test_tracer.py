@@ -306,6 +306,98 @@ class GraphModule(torch.nn.Module):
             fx_trace.replay({"pair": [x, y]}, scale=scale)
 
     @requires_gpus(1)
+    def test_replay_reallocates_released_storage_before_recording_stream(self) -> None:
+        @custom_op("test::reallocate_storage", mutates_args=("x",))
+        def reallocate_storage(x: torch.Tensor) -> torch.Tensor:
+            x.untyped_storage().resize_(x.numel() * x.element_size())
+            x.fill_(3)
+            return x
+
+        x = torch.empty(16, device="cuda")
+        fx_trace = make_cudagraph_fx(reallocate_storage)(x)
+        torch.cuda.synchronize()
+        x.untyped_storage().resize_(0)
+        recorded = []
+        original_record_stream = torch.Tensor.record_stream
+
+        def record_live_storage(tensor, stream):
+            assert tensor.untyped_storage().nbytes() > 0
+            recorded.append(tensor)
+            return original_record_stream(tensor, stream)
+
+        with patch.object(torch.Tensor, "record_stream", record_live_storage):
+            result = fx_trace.replay(x)
+
+        assert any(tensor is result for tensor in recorded)
+        torch.testing.assert_close(result, torch.full_like(result, 3), rtol=0, atol=0)
+
+    @requires_gpus(1)
+    def test_replay_uses_optional_remat_placeholder_check(self) -> None:
+        self.addCleanup(interpreter._remat_placeholder_check.cache_clear)
+        x = torch.empty(4, device="cuda")
+        fx_trace = make_cudagraph_fx(lambda x: x.view(2, 2))(x)
+        remat = SimpleNamespace(
+            is_placeholder=lambda tensor: tensor.untyped_storage()
+            is x.untyped_storage()
+        )
+
+        for module in (None, remat):
+            interpreter._remat_placeholder_check.cache_clear()
+            with self.subTest(remat_available=module is not None):
+                with (
+                    patch.dict("sys.modules", {"torch_remat": module}),
+                    patch.object(torch.Tensor, "record_stream") as record_stream,
+                ):
+                    result = fx_trace.replay(x)
+                if module is None:
+                    record_stream.assert_called()
+                else:
+                    record_stream.assert_not_called()
+                assert result.shape == (2, 2)
+                assert result.untyped_storage() is x.untyped_storage()
+
+    def test_remat_placeholder_check_propagates_missing_dependency(self) -> None:
+        interpreter._remat_placeholder_check.cache_clear()
+        self.addCleanup(interpreter._remat_placeholder_check.cache_clear)
+        error = ModuleNotFoundError(
+            "No module named 'remat_dependency'", name="remat_dependency"
+        )
+        with pytest.raises(ModuleNotFoundError) as raised:
+            with patch("builtins.__import__", side_effect=error):
+                interpreter._remat_placeholder_check()
+        assert raised.value is error
+
+    @requires_gpus(1)
+    def test_replay_propagates_placeholder_check_errors(self) -> None:
+        interpreter._remat_placeholder_check.cache_clear()
+        self.addCleanup(interpreter._remat_placeholder_check.cache_clear)
+        x = torch.ones(4, device="cuda")
+        fx_trace = make_cudagraph_fx(lambda x: x + 1)(x)
+        remat = SimpleNamespace(is_placeholder=lambda tensor: False)
+        with (
+            patch.dict("sys.modules", {"torch_remat": remat}),
+            patch.object(
+                remat,
+                "is_placeholder",
+                side_effect=RuntimeError("placeholder check failed"),
+            ),
+            pytest.raises(RuntimeError, match="placeholder check failed"),
+        ):
+            fx_trace.replay(x)
+
+    @requires_gpus(1)
+    def test_replay_propagates_stream_recording_errors(self) -> None:
+        x = torch.ones(4, device="cuda")
+        fx_trace = make_cudagraph_fx(lambda x: x + 1)(x)
+        with (
+            patch.object(
+                torch.Tensor, "record_stream", side_effect=RuntimeError("record failed")
+            ),
+            pytest.raises(RuntimeError, match="record failed"),
+        ):
+            fx_trace.replay(x)
+
+    @requires_gpus(1)
     def test_replay_preserves_freed_input_storage_on_another_stream(self) -> None:
         if torch.cuda.memory.get_allocator_backend() != "native":
             pytest.skip("requires the native CUDA caching allocator")
