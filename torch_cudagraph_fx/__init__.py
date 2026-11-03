@@ -6,6 +6,9 @@
 
 from __future__ import annotations
 
+import os
+from importlib.util import find_spec
+
 from torch_cudagraph_fx._events import (
     CudaGraphEvent,
     new_event,
@@ -41,3 +44,11 @@ __all__ = [
     "record_event",
     "wait_event",
 ]
+
+if (
+    os.environ.get("CGFX_TRACING") == "1"
+    and find_spec("torch_cudagraph_fx.fb") is not None
+):
+    from torch_cudagraph_fx.fb import initialize as _initialize
+
+    _initialize()
