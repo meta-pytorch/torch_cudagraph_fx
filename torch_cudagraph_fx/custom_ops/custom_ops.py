@@ -11,7 +11,7 @@ import inspect
 import os
 from collections.abc import Callable, Iterable
 from types import MethodType
-from typing import Any
+from typing import Any, cast, TypeVar
 
 import torch
 import torch.utils._pytree as pytree
@@ -241,18 +241,25 @@ def custom_op(
     return lambda fn: CustomOp(qualname, fn, mutates_args)
 
 
+_F = TypeVar("_F", bound=Callable[..., Any])
+
+
 def trace_leaf(
     qualname: str,
     *,
     mutates_args: Iterable[str] | str = (),
-) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+) -> Callable[[_F], _F]:
     """Record calls as opaque graph nodes rather than tracing their bodies.
 
     Currently supported by CGFX. Set CGFX_TRACING=1 before decorating; otherwise
     the original function is returned unchanged. Argument and mutation semantics
-    follow custom_op.
+    follow custom_op. The decorated function keeps its signature for type
+    checkers, since a leaf is called exactly like the function it wraps.
     """
-    if os.environ.get("CGFX_TRACING") != "1":
-        return lambda fn: fn
 
-    return custom_op(qualname, mutates_args=mutates_args)
+    def decorate(fn: _F) -> _F:
+        if os.environ.get("CGFX_TRACING") != "1":
+            return fn
+        return cast(_F, CustomOp(qualname, fn, mutates_args))
+
+    return decorate
