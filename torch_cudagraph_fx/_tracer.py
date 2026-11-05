@@ -226,7 +226,11 @@ def _format_uncaptured_kernels(
     names = [k.name or k.node_type for k in uncaptured]
     lines = [
         f"torch_cudagraph_fx: {len(uncaptured)} kernel launch(es) had no fx node "
-        f"and are missing from the trace: {names}"
+        f"and are missing from the trace: {names}",
+        "These launches bypassed __torch_dispatch__. To capture them, wrap the "
+        'function that launches them in @torch_cudagraph_fx.trace_leaf("ns::op") '
+        "(set CGFX_TRACING=1 before it is imported) or in a custom op; see "
+        "'Tracing leaves' in the torch_cudagraph_fx README.",
     ]
     for kernel in uncaptured:
         lines.append(

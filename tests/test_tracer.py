@@ -1132,6 +1132,7 @@ def test_uncaptured_kernel_raise_names_the_launch() -> None:
         match=r"1 kernel launch\(es\) had no fx node.*missing from the trace.*_add_one",
     ) as exc_info:
         make_cudagraph_fx(fn)(x)
+    assert "@torch_cudagraph_fx.trace_leaf" in str(exc_info.value)
     assert "allow_missing_kernels=True to make_cudagraph_fx" in str(exc_info.value)
 
 
@@ -1157,6 +1158,7 @@ def test_allow_missing_kernels_warns_and_returns_trace() -> None:
         fx_trace = make_cudagraph_fx(fn, allow_missing_kernels=True)(x)
 
     assert len(warning_info) == 1
+    assert "@torch_cudagraph_fx.trace_leaf" in str(warning_info[0].message)
     assert "replay may produce incorrect results" in str(warning_info[0].message)
     assert warning_info[0].filename == __file__
     assert not any(node.op == "call_function" for node in fx_trace.graph.nodes)
