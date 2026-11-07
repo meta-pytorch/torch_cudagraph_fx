@@ -51,8 +51,6 @@ def _input_tensor_metadata(value: Any) -> NodeMetadata | None:
             "shape": list(value.shape),
             "stride": list(value.stride()) if value.layout is torch.strided else None,
             "dtype": str(value.dtype).removeprefix("torch."),
-            "device": str(value.device),
-            "layout": str(value.layout).removeprefix("torch."),
         }
     return None
 
@@ -421,6 +419,8 @@ class MetadataManager:
         with torch._C._DisableTorchDispatch():
             node_metadata(node)["tensor"] = {
                 **cast(NodeMetadata, _input_tensor_metadata(tensor)),
+                "device": str(tensor.device),
+                "layout": str(tensor.layout).removeprefix("torch."),
                 "element_size": tensor.element_size(),
                 "nbytes": tensor.numel() * tensor.element_size(),
                 "requires_grad": tensor.requires_grad,
