@@ -12,6 +12,8 @@ from torch_cudagraph_fx._events import (
     record_event,
     wait_event,
 )
+from torch_cudagraph_fx._indexed_graph import IndexedGraph, Op, OpGroup, Scope
+from torch_cudagraph_fx._interpreter import fused_op
 from torch_cudagraph_fx._references import trace_reference
 from torch_cudagraph_fx._tracer import (
     CudaGraphFxTrace,
@@ -33,6 +35,11 @@ __all__ = [
     "CudaGraphEvent",
     "CudaGraphFxTrace",
     "CudaGraphState",
+    "IndexedGraph",
+    "fused_op",
+    "Op",
+    "OpGroup",
+    "Scope",
     "custom_op",
     "trace_leaf",
     "trace_reference",

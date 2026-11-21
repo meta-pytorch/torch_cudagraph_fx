@@ -8,3 +8,5 @@
 - Traceable CUDA events, custom operations, and stream metadata.
 - CUDA graph capture completeness checks when graph annotations are available.
 - JSON export of operator and tensor metadata.
+- `CudaGraphFxTrace.indexed_graph`: operators addressable by phase, module path and
+  operator name, with module attribution for backward operators.

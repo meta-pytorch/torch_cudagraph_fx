@@ -21,7 +21,7 @@ from torch.multiprocessing.reductions import StorageWeakRef
 from torch.utils._pytree import tree_flatten
 from torch.utils._traceback import CapturedTraceback
 from torch.utils.hooks import RemovableHandle
-from torch.utils.weak import WeakIdRef
+from torch.utils.weak import WeakIdKeyDictionary, WeakIdRef
 
 CUDAGRAPH_FX_METADATA_KEY = "cudagraph_fx"
 FX_NODE_ANNOTATION_KEY = "cudagraph_fx.fx_node"
@@ -173,6 +173,76 @@ class StackTraceMetadataProvider(MetadataProvider):
         execution["stack_trace"] = _format_user_stack_summary(
             CapturedTraceback.extract(skip=1).summary()
         )
+
+
+class ModuleMetadataProvider(MetadataProvider):
+    def __init__(self) -> None:
+        self._names: WeakIdKeyDictionary = WeakIdKeyDictionary()
+        self._stack: list[str] = []
+
+    def before_call(
+        self,
+        node_meta: NodeMetadata,
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+    ) -> None:
+        if self._stack:
+            node_meta["module_fqn"] = self._stack[-1]
+
+    @contextmanager
+    def track_modules(self) -> Iterator[None]:
+        tracing_thread = get_ident()
+
+        def enter(module: torch.nn.Module, args: tuple[Any, ...]) -> None:
+            if get_ident() != tracing_thread:
+                return
+            if module not in self._names:
+                for name, child in module.named_modules():
+                    self._names.setdefault(child, name)
+            self._stack.append(self._names[module])
+
+        def leave(module: torch.nn.Module, args: tuple[Any, ...], output: Any) -> None:
+            if get_ident() == tracing_thread:
+                self._stack.pop()
+
+        before = torch.nn.modules.module.register_module_forward_pre_hook(enter)
+        after = torch.nn.modules.module.register_module_forward_hook(
+            leave, always_call=True
+        )
+        try:
+            yield
+        finally:
+            before.remove()
+            after.remove()
+            self._stack.clear()
+
+    def post_process(self, graph: fx.Graph) -> None:
+        """Backward inside forward records the enclosing module, so refine it from
+        the forward operators. Autograd post-processing must populate
+        forward_node_ids first."""
+        by_id = {node_fx_id(n): n for n in graph.nodes if n.op != "output"}
+        for node in graph.nodes:
+            if node.op != "call_function":
+                continue
+            paths = [
+                module.split(".")
+                for i in node_autograd_meta(node).get("forward_node_ids", [])
+                if isinstance(module := node_metadata(by_id[i]).get("module_fqn"), str)
+            ]
+            if not paths:
+                continue
+            common = []
+            for parts in zip(*paths):
+                if len(set(parts)) != 1:
+                    break
+                common.append(parts[0])
+            inferred = ".".join(common)
+            current = node_metadata(node).get("module_fqn")
+            if not isinstance(current, str) or (
+                inferred != current
+                and (current == "" or inferred.startswith(current + "."))
+            ):
+                node_metadata(node)["module_fqn"] = inferred
 
 
 class AutogradMetadataProvider(MetadataProvider):
@@ -367,10 +437,12 @@ class MetadataManager:
         self._graph = graph
         self._autograd_metadata = AutogradMetadataProvider()
         self._gradient_dependency_metadata = GradientDependencyMetadataProvider()
+        self._module_metadata = ModuleMetadataProvider()
         self._providers = [
             *providers,
             self._autograd_metadata,
             self._gradient_dependency_metadata,
+            self._module_metadata,
         ]
         self._storage_ids: dict[StorageWeakRef, int] = {}
 
@@ -440,6 +512,11 @@ class MetadataManager:
     def post_process(self) -> None:
         for provider in self._providers:
             provider.post_process(self._graph)
+
+    @contextmanager
+    def track_modules(self) -> Iterator[None]:
+        with self._module_metadata.track_modules():
+            yield
 
     @contextmanager
     def enable_autograd_hooks(self) -> Iterator[None]:

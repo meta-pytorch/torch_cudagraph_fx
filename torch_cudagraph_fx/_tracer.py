@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import functools
 import operator
 import warnings
 from collections.abc import Iterator
@@ -30,6 +31,7 @@ from torch_cudagraph_fx._cudagraph_annotations import (
 )
 from torch_cudagraph_fx._events import trace_cuda_event_constructors
 from torch_cudagraph_fx._export_json import export_graph
+from torch_cudagraph_fx._indexed_graph import IndexedGraph
 from torch_cudagraph_fx._interpreter import CudaGraphFxInterpreter, is_graph_variable
 from torch_cudagraph_fx._metadata import (
     bind_node_metadata,
@@ -444,6 +446,10 @@ class CudaGraphFxTrace:
     def graph(self) -> fx.Graph:
         return self._gm.graph
 
+    @functools.cached_property
+    def indexed_graph(self) -> IndexedGraph:
+        return IndexedGraph(self._gm)
+
     @property
     def in_spec(self) -> TreeSpec:
         return self._in_spec
@@ -511,6 +517,7 @@ def make_cudagraph_fx(
             torch.autograd.grad_mode.set_multithreading_enabled(False),
             annotated_capture(cuda_graph),
             trace_cuda_event_constructors(),
+            mode.metadata.track_modules(),
             mode,
             mode.metadata.enable_autograd_hooks(),
         ):

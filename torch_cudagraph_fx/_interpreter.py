@@ -43,6 +43,15 @@ def is_graph_variable(value: Any) -> bool:
     ) and not isinstance(value, Enum)
 
 
+def fused_op(name: str, region: fx.GraphModule, *args: Any) -> Any:
+    """Run the fused region ``name``, whose operators are the graph ``region``.
+
+    The region is interpreted: its generated code would resolve custom operators
+    to overload packets, which return unflattened outputs.
+    """
+    return fx.Interpreter(region).run(*args)
+
+
 class CudaGraphFxInterpreter(fx.Interpreter):
     """Execute a ``torch_cudagraph_fx.trace`` graph with the traced stream topology.
 

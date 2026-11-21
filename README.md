@@ -142,6 +142,34 @@ interpreter enforces. Because the event nodes are in the graph and replayed in
 order on their streams, multi-stream graphs replay with the cross-stream
 dependencies intact, so the result is correct — not just the stream assignment.
 
+### Indexed graph
+
+`fx_trace.indexed_graph` addresses every operator by autograd phase, the
+module that ran it and its operator name. Integer module names become
+subscripts, and an operator name that occurs more than once in a module gets an
+index:
+
+```python
+ig = fx_trace.indexed_graph
+ig.fwd.layers[0]
+ig.resolve(ig.fwd.layers[0])  # its operators, in graph order
+ig.bwd.layers[0].attention.mul
+ig.bwd.layers[0].attention.mul[2]
+ig["bwd.layers[0].attention.mul[2]"]
+ig.select("fwd.layers[*].norm.*")
+```
+
+`[*]` matches one subscript: this pattern matches `fwd.layers[1].norm.add`,
+but excludes `fwd.layers[0].blocks[1].norm.add`. Wildcards inside brackets
+stay within that subscript. Outside brackets, `*` can span descendant scopes,
+so the trailing `norm.*` also includes operators in submodules of `norm`.
+
+Module names are relative to the first module the traced function enters.
+Backward operators are named after the module of the forward operators they
+differentiate, even when backward runs inside an enclosing module's forward.
+Operators without a module, such as autograd's gradient-accumulation adds, sit
+directly under their phase: `ig.bwd.add[0]`, `ig.bwd.add[1]`, and so on.
+
 ## Completeness check
 
 The tracer only sees ops that go through `__torch_dispatch__`; a kernel launched
