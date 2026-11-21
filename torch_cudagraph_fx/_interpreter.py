@@ -19,7 +19,7 @@ from torch_cudagraph_fx._cudagraph_annotations import mark_kernels
 from torch_cudagraph_fx._metadata import (
     FX_NODE_ANNOTATION_KEY,
     FX_NODE_ID_KEY,
-    node_fx_id,
+    node_metadata,
     node_stream,
 )
 from torch_cudagraph_fx._references import is_trace_reference
@@ -113,10 +113,9 @@ class CudaGraphFxInterpreter(fx.Interpreter):
         if n.op != "call_function":
             return super().run_node(n)
         stream = self._stream_for(node_stream(n) or 0)
-        annotation = {
-            FX_NODE_ANNOTATION_KEY: True,
-            FX_NODE_ID_KEY: node_fx_id(n),
-        }
+        annotation = {FX_NODE_ANNOTATION_KEY: True}
+        if isinstance(node_id := node_metadata(n).get(FX_NODE_ID_KEY), int):
+            annotation[FX_NODE_ID_KEY] = node_id
         with torch.cuda.stream(stream), mark_kernels(annotation):
             replay_stream = torch.cuda.current_stream()
             with self._set_current_node(n):

@@ -170,6 +170,37 @@ differentiate, even when backward runs inside an enclosing module's forward.
 Operators without a module, such as autograd's gradient-accumulation adds, sit
 directly under their phase: `ig.bwd.add[0]`, `ig.bwd.add[1]`, and so on.
 
+### Schedule plans
+
+A `SchedulePlan` records fusions against the index. Each `fuse(name, targets)`
+call defines one region from `Op`, `OpGroup` or `Scope` handles; `apply()`
+returns a transformed copy of the index whose `graph_module` runs each region as
+`fused_op(name, region, *args)`, where `region` is the submodule holding its
+operators:
+
+```python
+from torch_cudagraph_fx import SchedulePlan
+
+ig = fx_trace.indexed_graph
+plan = SchedulePlan(ig)
+for i in ig.fwd.layers:
+    layer = ig.fwd.layers[i]
+    plan.fuse("norm", [layer.norm])
+graph_module = plan.apply().graph_module
+```
+
+Region names get a suffix from a counter shared across the plan: the calls above
+create `norm_0`, `norm_1`, and so on.
+
+A region can hold any operator with a schema except collectives, may mix forward
+and backward operators, and must run on one CUDA stream. Its call goes at its
+last operator: nodes in between that depend on the region, through a tensor or a
+storage, move after the call, and a region operator that depends on a moved node
+raises. A region cannot contain or cross a barrier, an operator whose effect is
+not visible in its inputs, outputs and schema: events, eager `c10d` collectives
+and higher-order operators other than `flex_attention`. Literal arguments become
+trailing call arguments, so regions that differ only in constants share code.
+
 ## Completeness check
 
 The tracer only sees ops that go through `__torch_dispatch__`; a kernel launched

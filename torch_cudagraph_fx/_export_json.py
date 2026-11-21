@@ -15,9 +15,11 @@ from typing import Any, cast
 
 import torch.fx as fx
 from torch_cudagraph_fx._metadata import (
+    FX_NODE_ID_KEY,
     JsonValue,
     node_autograd_meta,
     node_fx_id,
+    node_metadata,
     node_tensor_meta,
 )
 
@@ -123,6 +125,10 @@ def export_graph(graph: fx.Graph, path: str | PathLike[str]) -> None:
         if node.op == "output":
             outputs = _json_value(node.args[0])
             continue
+        if not isinstance(node_metadata(node).get(FX_NODE_ID_KEY), int):
+            raise ValueError(
+                "JSON export requires original trace IDs; inspect transformed graphs with IndexedGraph"
+            )
         node_id = str(node_fx_id(node))
         operators[node_id] = _operator_record(node)
         tensor = node_tensor_meta(node)
