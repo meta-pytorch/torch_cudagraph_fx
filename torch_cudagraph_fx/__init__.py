@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+from torch_cudagraph_fx._compile import cgfx_compile, CompiledFunction
 from torch_cudagraph_fx._events import (
     CudaGraphEvent,
     new_event,
@@ -31,6 +32,8 @@ from torch_cudagraph_fx.custom_ops import (
 )
 
 __all__ = [
+    "cgfx_compile",
+    "CompiledFunction",
     "OpaqueRef",
     "trace_dataclass",
     "register_dataclass_pytree",

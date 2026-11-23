@@ -7,9 +7,11 @@
 from __future__ import annotations
 
 import functools
+import gc
 import operator
 import warnings
-from collections.abc import Iterator
+import weakref
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum
@@ -19,6 +21,7 @@ from typing import Any, Callable
 import torch
 import torch.fx as fx
 import torch.utils._pytree as pytree
+from torch.multiprocessing.reductions import StorageWeakRef
 from torch.utils._python_dispatch import TorchDispatchMode
 from torch.utils._pytree import tree_flatten, tree_map, TreeSpec
 from torch.utils.weak import WeakIdKeyDictionary
@@ -35,11 +38,15 @@ from torch_cudagraph_fx._indexed_graph import IndexedGraph
 from torch_cudagraph_fx._interpreter import CudaGraphFxInterpreter, is_graph_variable
 from torch_cudagraph_fx._metadata import (
     bind_node_metadata,
+    FREE_AFTER_KEY,
     FX_NODE_ANNOTATION_KEY,
     FX_NODE_ID_KEY,
     MetadataManager,
+    node_fx_id,
     node_fx_id_from_metadata,
+    node_metadata,
     node_stream,
+    node_tensor_meta,
     NodeMetadata,
     StackTraceMetadataProvider,
     StreamMetadataProvider,
@@ -253,6 +260,18 @@ def _format_uncaptured_kernels(
     return "\n".join(lines)
 
 
+def _address(tensor: torch.Tensor) -> int:
+    """The address of the storage of ``tensor``, or 0 if it holds no memory or
+    forbids reading its address, as a placeholder for freed memory can."""
+    storage = tensor.untyped_storage()
+    if not storage.nbytes():
+        return 0
+    try:
+        return storage.data_ptr()
+    except RuntimeError:
+        return 0
+
+
 class _CudagraphFxDispatchMode(TorchDispatchMode):
     """Record each dispatched op as an fx node, tagged with its current CUDA stream.
 
@@ -278,10 +297,17 @@ class _CudagraphFxDispatchMode(TorchDispatchMode):
         self.graph = graph
         self.root: torch.nn.Module = torch.nn.Module()
         self._value_to_node: WeakIdKeyDictionary = WeakIdKeyDictionary()
+        # The latest input or result of each storage, by address and dtype.
+        self._storages: dict[
+            tuple[int, torch.dtype], tuple[StorageWeakRef, fx.Node]
+        ] = {}
         # Root attributes keep constants alive, so their ids cannot be reused.
         self._constant_nodes: dict[int, fx.Node] = {}
         self._next_constant_index = 0
         self._stream_ids: dict[int, int] = {}
+        self._newest: fx.Node | None = None
+        # Operator results, watched so replay can free each where tracing did.
+        self._lifetimes: list[tuple[fx.Node, weakref.finalize]] = []
         self.metadata = MetadataManager(
             graph,
             [
@@ -316,20 +342,57 @@ class _CudagraphFxDispatchMode(TorchDispatchMode):
             node_meta = self.metadata.new_node_metadata()
         node = self.graph.create_node(op, target, args, kwargs)
         bind_node_metadata(node, node_meta)
+        self._newest = node
         return node
 
     def _bind_value(
         self,
         value: Any,
         node: fx.Node,
+        *,
+        created: bool = False,
     ) -> None:
-        """Register a runtime value and enrich its already attached node metadata."""
+        """Register a runtime value and enrich its already attached node metadata.
+        ``created`` marks an operator result that tracing allocated."""
         if is_graph_variable(value):
+            # An in-place result is a tensor that already has a binding.
+            created = created and value not in self._value_to_node
             self._value_to_node[value] = node
+            if created and isinstance(value, torch.Tensor):
+                watch = weakref.finalize(value, self._record_free, node)
+                self._lifetimes.append((node, watch))
         else:
             self._constant_nodes[id(value)] = node
         if isinstance(value, torch.Tensor):
             self.metadata.add_tensor_meta(node, value)
+            # Constants and weights persist, so a tensor sharing their storage
+            # is one too.
+            persistent = node_tensor_meta(node)["type"] in ("constant", "weight")
+            if not persistent and (address := _address(value)):
+                storage = StorageWeakRef(value.untyped_storage())
+                self._storages[address, value.dtype] = (storage, node)
+
+    def _record_free(self, node: fx.Node) -> None:
+        assert self._newest is not None
+        node_metadata(node)[FREE_AFTER_KEY] = node_fx_id(self._newest)
+
+    def finish(self, *, release_escaped: bool) -> list[tuple[fx.Node, torch.Tensor]]:
+        """Stop watching results. With ``release_escaped``, return the results
+        still referenced after tracing, with their storage freed: tracing never
+        computed them."""
+        if release_escaped:
+            gc.collect()
+        escaped = []
+        for node, watch in self._lifetimes:
+            alive = watch.detach()
+            # A tensor whose storage the function freed holds nothing to rebind.
+            if release_escaped and alive and alive[0].untyped_storage().nbytes():
+                escaped.append((node, alive[0]))
+        self._lifetimes.clear()
+        with torch.no_grad():
+            for _, value in escaped:
+                value.set_()
+        return escaped
 
     def _lookup_value(
         self,
@@ -359,9 +422,29 @@ class _CudagraphFxDispatchMode(TorchDispatchMode):
             return value
         if (node := self._lookup_value(value)) is not None:
             return node
+        if isinstance(value, torch.Tensor) and (node := self._view_of(value)):
+            return node
         node = self._lift_constant(value)
         self._bind_value(value, node)
         return node
+
+    def _view_of(self, value: torch.Tensor) -> fx.Node | None:
+        """A tensor made without dispatch, such as one autograd or DLPack wraps
+        around existing memory, that shares the live storage of an input or
+        result is a view of it; as a constant, it would keep the traced storage
+        and its values."""
+        entry = self._storages.get((_address(value), value.dtype))
+        if entry is None or entry[0].expired():
+            return None
+        args = (value.size(), value.stride(), value.storage_offset())
+        self._record_call_function(
+            torch.ops.aten.as_strided.default,
+            (entry[1], *args),
+            {},
+            value,
+            self.metadata.before_call((value, *args), {}),
+        )
+        return self._value_to_node[value]
 
     def _lift_constant(self, value: Any) -> fx.Node:
         name = f"_constant_{self._next_constant_index}"
@@ -374,9 +457,14 @@ class _CudagraphFxDispatchMode(TorchDispatchMode):
         node: fx.Node,
         out: Any,
     ) -> None:
+        # ATen results are new tensors or inputs; a custom operator can return a
+        # tensor it keeps, such as a cached workspace.
+        created = isinstance(
+            node.target, torch._ops.OpOverload
+        ) and node.target.namespace in ("aten", "prims")
         for path, value in pytree.tree_flatten_with_path(out)[0]:
             if is_graph_variable(value):
-                self._bind_value(value, self.project(node, path))
+                self._bind_value(value, self.project(node, path), created=created)
 
     def _record_call_function(
         self,
@@ -432,11 +520,20 @@ class CudaGraphFxTrace:
         out_spec: TreeSpec,
         *,
         cudagraph_state: CudaGraphState | None = None,
+        escaped: Sequence[torch.Tensor] = (),
     ) -> None:
         self._gm = graph_module
         self._in_spec = in_spec
         self._out_spec = out_spec
         self._cudagraph_state = cudagraph_state
+        self._escaped = tuple(escaped)
+
+    @property
+    def escaped(self) -> tuple[torch.Tensor, ...]:
+        """Tensors that tracing created and its caller still references. The
+        graph returns them after the function's outputs, and replay makes each
+        one alias its new value."""
+        return self._escaped
 
     @property
     def graph_module(self) -> fx.GraphModule:
@@ -453,6 +550,10 @@ class CudaGraphFxTrace:
     @property
     def in_spec(self) -> TreeSpec:
         return self._in_spec
+
+    @property
+    def out_spec(self) -> TreeSpec:
+        return self._out_spec
 
     def cudagraph_states(self) -> CudaGraphState | None:
         return self._cudagraph_state
@@ -482,7 +583,10 @@ class CudaGraphFxTrace:
 
     def _interpreter(self) -> CudaGraphFxInterpreter:
         return CudaGraphFxInterpreter(
-            self._gm, in_spec=self._in_spec, out_spec=self._out_spec
+            self._gm,
+            in_spec=self._in_spec,
+            out_spec=self._out_spec,
+            escaped=self._escaped,
         )
 
     def export_json(self, path: str | PathLike[str]) -> None:
@@ -507,7 +611,12 @@ def make_cudagraph_fx(
     *,
     retain_cudagraph: bool = False,
     allow_missing_kernels: bool = False,
+    pool: tuple[int, int] | None = None,
+    stream: torch.cuda.Stream | None = None,
 ) -> Callable[..., CudaGraphFxTrace]:
+    """``pool`` and ``stream`` set the memory pool and stream of the tracing
+    capture, as in ``torch.cuda.graph``."""
+
     def traced(*args: Any, **kwargs: Any) -> CudaGraphFxTrace:
         graph = fx.Graph()
         mode = _CudagraphFxDispatchMode(graph)
@@ -515,7 +624,7 @@ def make_cudagraph_fx(
         cuda_graph = torch.cuda.CUDAGraph(keep_graph=True)
         with (
             torch.autograd.grad_mode.set_multithreading_enabled(False),
-            annotated_capture(cuda_graph),
+            annotated_capture(cuda_graph, pool=pool, stream=stream),
             trace_cuda_event_constructors(),
             mode.metadata.track_modules(),
             mode,
@@ -526,26 +635,28 @@ def make_cudagraph_fx(
             out = fn(*args, **kwargs)
             out_flat, out_spec = tree_flatten(out)
             # Older FX codegen uses repr() for outputs, which is invalid for enums.
-            graph.output(
-                tuple(
-                    mode._lift_constant(o) if isinstance(o, Enum) else mode.lift(o)
-                    for o in out_flat
-                )
+            outputs = tuple(
+                mode._lift_constant(o) if isinstance(o, Enum) else mode.lift(o)
+                for o in out_flat
             )
         _check_uncaptured_kernels(
             cuda_graph, allow_missing_kernels=allow_missing_kernels
         )
+        state = None
+        if retain_cudagraph:
+            # The retained graph computes the traced tensors themselves.
+            state = CudaGraphState(cuda_graph, flat_args, out_flat)
+        del out, out_flat
+        escaped = mode.finish(release_escaped=not retain_cudagraph)
+        graph.output((*outputs, *(node for node, _ in escaped)))
         mode.metadata.post_process()
         gm = fx.GraphModule(mode.root, graph)
         return CudaGraphFxTrace(
             gm,
             in_spec,
             out_spec,
-            cudagraph_state=(
-                CudaGraphState(cuda_graph, flat_args, out_flat)
-                if retain_cudagraph
-                else None
-            ),
+            cudagraph_state=state,
+            escaped=[value for _, value in escaped],
         )
 
     return traced

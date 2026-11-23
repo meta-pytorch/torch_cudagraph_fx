@@ -26,6 +26,8 @@ from torch.utils.weak import WeakIdKeyDictionary, WeakIdRef
 CUDAGRAPH_FX_METADATA_KEY = "cudagraph_fx"
 FX_NODE_ANNOTATION_KEY = "cudagraph_fx.fx_node"
 FX_NODE_ID_KEY = "fx_node_id"
+# The fx_node_id of the newest node when the traced value died.
+FREE_AFTER_KEY = "free_after"
 
 JsonValue: TypeAlias = (
     None | bool | int | float | str | list["JsonValue"] | dict[str, "JsonValue"]

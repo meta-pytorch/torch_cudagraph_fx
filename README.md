@@ -37,6 +37,12 @@ syncs or data-dependent control flow on this step's values, and any side stream
 must be joined to the capturing stream (`side.wait_stream(main)`) before use and
 joined back afterward.
 
+`pool` and `stream` set the memory pool and stream of the tracing capture, as in
+`torch.cuda.graph`. To trace a step that ran eagerly in a graph pool, pass that
+pool, so the trace reuses the step's cached memory instead of allocating it
+again, and the stream the step ran on, so that autograd keeps its work on the
+capturing stream.
+
 ### End-to-end example
 
 ```python
@@ -225,6 +231,69 @@ whose defining modules the pattern hashes. Other operators, such as those of
 C++ extensions, are rejected: the cache file could neither import nor hash
 their definitions.
 
+### `cgfx_compile`
+
+`cgfx_compile` puts the pieces together for a CUDA-graphable callable:
+
+```python
+from torch_cudagraph_fx import cgfx_compile, SchedulePlan
+
+
+def configure_schedule(plan: SchedulePlan) -> None:
+    ig = plan.indexed_graph
+    for i in ig.fwd.layers:
+        plan.fuse("layer", [ig.fwd.layers[i]])
+
+
+@cgfx_compile(schedule=configure_schedule, kernel_cache_dir="/path/to/kernel_cache")
+def train_step(batch):
+    loss = model(batch).sum()
+    loss.backward()
+    return loss
+```
+
+The first call traces the function and creates a `SchedulePlan` for the traced
+graph. The optional `schedule(plan)` callback adds fusion requests using handles
+from `plan.indexed_graph` and returns `None`. The compiler applies the plan,
+substitutes cached kernels for fused regions (creating stubs for new
+specializations), captures the result into one CUDA graph and replays it.
+Later calls replay the graph without invoking the callback. Create a new
+compiled callable to trace and configure another plan. Omitting `schedule`
+keeps the trace unfused. The compiled callable exposes `graph_module` and
+`cuda_graph` after its first call.
+
+Missing kernels emit warnings rather than raising; `cgfx_compile` always uses
+`allow_missing_kernels=True` for tracing and capture checks.
+
+Each call runs the function's GPU work once; Python side effects in the
+function happen only while tracing. Tensor arguments are captured by address:
+other tensors passed later are copied into them and must keep their shape,
+stride, dtype and device. Other arguments must equal the traced values. Kernels
+that compile on first use compile during capture, which uses relaxed capture mode.
+
+`pool` and `stream` set the memory pool and stream of both captures, the
+trace's and the CUDA graph's.
+
+A caller that captures CUDA graphs itself can call `lower(*args, **kwargs)`
+instead. It traces, applies the plan and substitutes kernels as the first call
+does, but neither runs nor captures the function, and returns a
+`CudaGraphFxTrace`. Its `replay(*args, **kwargs)` runs the graph on the current
+stream, inside the caller's capture if there is one, and in that capture's mode.
+Replay it with autograd disabled, because the trace already records the backward
+operators. Each `lower` call traces again and leaves the compiled callable
+unchanged.
+
+Pass the capture's `pool` and `stream` to `cgfx_compile` so the trace shares
+them:
+
+```python
+compiled = cgfx_compile(step, schedule=configure_schedule, pool=pool, stream=stream)
+lowered = compiled.lower(static_batch)
+graph = torch.cuda.CUDAGraph()
+with torch.no_grad(), torch.cuda.graph(graph, pool=pool, stream=stream):
+    static_loss = lowered.replay(static_batch)
+```
+
 ## Completeness check
 
 The tracer only sees ops that go through `__torch_dispatch__`; a kernel launched
@@ -384,7 +453,7 @@ This is an early prototype. Known gaps (see `DESIGN.md` for context):
 
 - **Real tensor allocations** — tracing is record-relaxed (kernels recorded, not
   run), but tensors are still really allocated, so a trace costs the step's peak
-  memory.
+  memory, in the capture's `pool`.
 - **Events use `torch_cudagraph_fx` ops in the FX graph.** Native PyTorch CUDA
   events constructed inside the traced function are temporarily monkey-patched
   into `new_event` / `record_event` / `wait_event` nodes. Pre-existing native

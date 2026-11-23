@@ -306,32 +306,6 @@ class GraphModule(torch.nn.Module):
             fx_trace.replay({"pair": [x, y]}, scale=scale)
 
     @requires_gpus(1)
-    def test_replay_reallocates_released_storage_before_recording_stream(self) -> None:
-        @custom_op("test::reallocate_storage", mutates_args=("x",))
-        def reallocate_storage(x: torch.Tensor) -> torch.Tensor:
-            x.untyped_storage().resize_(x.numel() * x.element_size())
-            x.fill_(3)
-            return x
-
-        x = torch.empty(16, device="cuda")
-        fx_trace = make_cudagraph_fx(reallocate_storage)(x)
-        torch.cuda.synchronize()
-        x.untyped_storage().resize_(0)
-        recorded = []
-        original_record_stream = torch.Tensor.record_stream
-
-        def record_live_storage(tensor, stream):
-            assert tensor.untyped_storage().nbytes() > 0
-            recorded.append(tensor)
-            return original_record_stream(tensor, stream)
-
-        with patch.object(torch.Tensor, "record_stream", record_live_storage):
-            result = fx_trace.replay(x)
-
-        assert any(tensor is result for tensor in recorded)
-        torch.testing.assert_close(result, torch.full_like(result, 3), rtol=0, atol=0)
-
-    @requires_gpus(1)
     def test_replay_frees_unused_results(self) -> None:
         def fn(x: torch.Tensor) -> torch.Tensor:
             _ = x * 2
@@ -349,106 +323,93 @@ class GraphModule(torch.nn.Module):
         torch.testing.assert_close(got, x + 1, rtol=0, atol=0)
 
     @requires_gpus(1)
-    def test_replay_uses_optional_remat_placeholder_check(self) -> None:
-        self.addCleanup(interpreter._remat_placeholder_check.cache_clear)
-        x = torch.empty(4, device="cuda")
-        fx_trace = make_cudagraph_fx(lambda x: x.view(2, 2))(x)
-        remat = SimpleNamespace(
-            is_placeholder=lambda tensor: tensor.untyped_storage()
-            is x.untyped_storage()
-        )
+    def test_replay_frees_cross_stream_values_where_tracing_did(self) -> None:
+        side = torch.cuda.Stream()
+        w = torch.randn(2048, 2048, device="cuda") / 64
 
-        for module in (None, remat):
-            interpreter._remat_placeholder_check.cache_clear()
-            with self.subTest(remat_available=module is not None):
-                with (
-                    patch.dict("sys.modules", {"torch_remat": module}),
-                    patch.object(torch.Tensor, "record_stream") as record_stream,
-                ):
-                    result = fx_trace.replay(x)
-                if module is None:
-                    record_stream.assert_called()
-                else:
-                    record_stream.assert_not_called()
-                assert result.shape == (2, 2)
-                assert result.untyped_storage() is x.untyped_storage()
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            main = torch.cuda.current_stream()
+            total = torch.zeros_like(x)
+            for i in range(4):
+                side.wait_stream(main)
+                with torch.cuda.stream(side):
+                    y = x * (i + 2)
+                main.wait_stream(side)
+                v = w
+                for _ in range(30):  # delays the main stream's read of y
+                    v = v @ w
+                total += y + v[0, 0]
+                # Freeing y at its last use would let z reuse its memory before
+                # the main stream reads it; tracing frees y after the wait below.
+                with torch.cuda.stream(side):
+                    z = torch.full_like(x, -1.0)
+                side.wait_stream(main)
+                main.wait_stream(side)
+                total += z
+            return total
 
-    def test_remat_placeholder_check_propagates_missing_dependency(self) -> None:
-        interpreter._remat_placeholder_check.cache_clear()
-        self.addCleanup(interpreter._remat_placeholder_check.cache_clear)
-        error = ModuleNotFoundError(
-            "No module named 'remat_dependency'", name="remat_dependency"
-        )
-        with pytest.raises(ModuleNotFoundError) as raised:
-            with patch("builtins.__import__", side_effect=error):
-                interpreter._remat_placeholder_check()
-        assert raised.value is error
+        x = torch.ones(1 << 22, device="cuda")
+        fx_trace = make_cudagraph_fx(fn)(x)
 
-    @requires_gpus(1)
-    def test_replay_propagates_placeholder_check_errors(self) -> None:
-        interpreter._remat_placeholder_check.cache_clear()
-        self.addCleanup(interpreter._remat_placeholder_check.cache_clear)
-        x = torch.ones(4, device="cuda")
-        fx_trace = make_cudagraph_fx(lambda x: x + 1)(x)
-        remat = SimpleNamespace(is_placeholder=lambda tensor: False)
-        with (
-            patch.dict("sys.modules", {"torch_remat": remat}),
-            patch.object(
-                remat,
-                "is_placeholder",
-                side_effect=RuntimeError("placeholder check failed"),
-            ),
-            pytest.raises(RuntimeError, match="placeholder check failed"),
-        ):
-            fx_trace.replay(x)
+        def capture(run: Callable[[torch.Tensor], torch.Tensor]) -> tuple[Any, ...]:
+            torch.cuda.synchronize()
+            graph = torch.cuda.CUDAGraph()
+            start = torch.cuda.memory_allocated()
+            torch.cuda.reset_peak_memory_stats()
+            with torch.cuda.graph(graph):
+                out = run(x)
+            peak = torch.cuda.max_memory_allocated() - start
+            graph.replay()
+            torch.cuda.synchronize()
+            return peak, out
+
+        eager_peak, expected = capture(fn)
+        replay_peak, got = capture(fx_trace.replay)
+        assert replay_peak <= eager_peak, (replay_peak, eager_peak)
+        torch.testing.assert_close(got, expected, rtol=0, atol=0)
 
     @requires_gpus(1)
-    def test_replay_propagates_stream_recording_errors(self) -> None:
-        x = torch.ones(4, device="cuda")
-        fx_trace = make_cudagraph_fx(lambda x: x + 1)(x)
-        with (
-            patch.object(
-                torch.Tensor, "record_stream", side_effect=RuntimeError("record failed")
-            ),
-            pytest.raises(RuntimeError, match="record failed"),
-        ):
-            fx_trace.replay(x)
+    def test_replay_rebinds_tensors_the_function_keeps(self) -> None:
+        kept = []
+
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            kept[:] = [x * 2]
+            return x + 1
+
+        fx_trace = make_cudagraph_fx(fn)(torch.ones(4, device="cuda"))
+        assert len(fx_trace.escaped) == 1 and kept[0].numel() == 0
+        x = torch.full((4,), 3.0, device="cuda")
+        torch.testing.assert_close(fx_trace.replay(x), x + 1, rtol=0, atol=0)
+        torch.testing.assert_close(kept[0], x * 2, rtol=0, atol=0)
 
     @requires_gpus(1)
-    def test_replay_preserves_freed_input_storage_on_another_stream(self) -> None:
-        if torch.cuda.memory.get_allocator_backend() != "native":
-            pytest.skip("requires the native CUDA caching allocator")
+    def test_replay_reads_tensors_made_without_dispatch(self) -> None:
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            # DLPack wraps the memory of the product without dispatching an op.
+            return torch.from_dlpack(x * 2) + 1
 
-        @custom_op("test::read_and_free_storage", mutates_args=("x", "out"))
-        def read_and_free(x: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
-            out.copy_(x)
-            x.untyped_storage().resize_(0)
-            return out
+        fx_trace = make_cudagraph_fx(fn)(torch.ones(4, device="cuda"))
+        nodes = fx_trace.graph_module.graph.nodes
+        assert not [n for n in nodes if n.op == "get_attr"]
+        x = torch.full((4,), 3.0, device="cuda")
+        torch.testing.assert_close(fx_trace.replay(x), x * 2 + 1, rtol=0, atol=0)
 
-        size = 1024 * 1024
-        fx_trace = make_cudagraph_fx(read_and_free)(
-            torch.empty(size, device="cuda"), torch.empty(size, device="cuda")
+    @requires_gpus(1)
+    def test_replay_keeps_tensors_a_custom_operator_returns(self) -> None:
+        workspace = []
+
+        @custom_op("test::kept_workspace", mutates_args=())
+        def kept_workspace(x: torch.Tensor) -> torch.Tensor:
+            if not workspace:
+                workspace.append(torch.empty_like(x))
+            return workspace[0].copy_(x)
+
+        fx_trace = make_cudagraph_fx(lambda x: kept_workspace(x) + 1)(
+            torch.ones(4, device="cuda")
         )
-        torch.cuda.synchronize()
-        torch.cuda.empty_cache()
-
-        x = torch.ones(size, device="cuda")
-        out = torch.empty_like(x)
-        consumer_stream = torch.cuda.Stream()
-        consumer_stream.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(consumer_stream):
-            torch.cuda._sleep(200_000_000)
-            result = fx_trace.replay(x, out)
-
-        replacement = torch.full_like(out, 7.0)
-        consumer_pending = not consumer_stream.query()
-        torch.cuda.synchronize()
-        del replacement
-
-        assert consumer_pending, (
-            "the input read must overlap the replacement allocation"
-        )
-        torch.testing.assert_close(result, torch.ones_like(result), rtol=0, atol=0)
+        assert fx_trace.escaped == ()
+        x = torch.full((4,), 3.0, device="cuda")
+        torch.testing.assert_close(fx_trace.replay(x), x + 1, rtol=0, atol=0)
 
     @requires_gpus(1)
     def test_replay_supports_non_tensor_outputs(self) -> None:
