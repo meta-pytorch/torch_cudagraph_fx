@@ -43,12 +43,21 @@ def is_graph_variable(value: Any) -> bool:
     ) and not isinstance(value, Enum)
 
 
-def fused_op(name: str, region: fx.GraphModule, *args: Any) -> Any:
-    """Run the fused region ``name``, whose operators are the graph ``region``.
+# Kernels that `substitute_with_kernels` loaded, by absolute cache file path.
+loaded_kernels: dict[str, Callable[..., Any]] = {}
+
+
+def fused_op(
+    name: str, region: fx.GraphModule, *args: Any, cache_path: str | None = None
+) -> Any:
+    """Run the fused region ``name``, whose operators are the graph ``region``, or
+    the ``run`` of its kernel cache file ``cache_path``.
 
     The region is interpreted: its generated code would resolve custom operators
     to overload packets, which return unflattened outputs.
     """
+    if cache_path is not None:
+        return loaded_kernels[cache_path](*args)
     return fx.Interpreter(region).run(*args)
 
 

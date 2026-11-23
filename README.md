@@ -201,6 +201,30 @@ not visible in its inputs, outputs and schema: events, eager `c10d` collectives
 and higher-order operators other than `flex_attention`. Literal arguments become
 trailing call arguments, so regions that differ only in constants share code.
 
+### Kernel caches
+
+`substitute_with_kernels(graph_module, cache_dir)` looks up each fused region
+in a two-level cache, `<cache_dir>/pat_<pattern>/<specialization>.py`. The
+pattern hashes the region's operator structure, ignoring literal values and
+view placement; the specialization hashes its `SPEC`: tensor interface (shapes,
+strides, dtypes, device types and aliasing), the hash of its reference code,
+and the numerics environment. Storage offsets are not part of the key, so a
+kernel must accept views at any offset. A missing specialization is written as
+a stub with the generated `SPEC` and `reference`, an `impl` that raises, and
+`run = reference`. To supply a kernel, write `impl` with the same signature and
+select `run = impl`. `SPEC` and `reference` must not be edited. Each region's
+call then runs its file's `run`, passing the call site's constants:
+`substitute_with_kernels` sets the call's `cache_path` to the file's absolute
+path. Constants are arguments, so regions that differ only in constant values
+share one kernel; `SPEC` lists each constant's type, with the value from the
+call that created the file as an `example`.
+
+A cached region can hold ATen and prims operators, and Python operators defined
+with `torch.library.custom_op`, `triton_op` or `torch_cudagraph_fx.custom_op`,
+whose defining modules the pattern hashes. Other operators, such as those of
+C++ extensions, are rejected: the cache file could neither import nor hash
+their definitions.
+
 ## Completeness check
 
 The tracer only sees ops that go through `__torch_dispatch__`; a kernel launched
